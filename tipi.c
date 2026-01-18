@@ -2,179 +2,135 @@
 
 #include <string.h>
 
+static void stipi_flush_frame(tipi_ctx_t* ctx);
+static void stipi_write_raw(tipi_ctx_t* ctx, const uint8_t* data, uint16_t len);
 static uint8_t stipi_encode_varint(uint32_t value, uint8_t* out);
-static tipi_error_t stipi_push_record(tipi_ctx_t* ctx, tipi_record_t* rec);
+static uint16_t stipi_crc16(const uint8_t* data, uint16_t len);
+static uint16_t stipi_cobs_encode(const uint8_t* ptr, uint16_t length, uint8_t* dst);
+static uint32_t stipi_zigzag_encode(int32_t n);
 
-tipi_error_t tipi_initialize(tipi_ctx_t* ctx, uint8_t* buf, uint16_t buf_size, tipi_write_fn write_fn) {
+tipi_error_t tipi_init(tipi_ctx_t* ctx, uint8_t* buf, uint16_t buf_size, tipi_write_fn write_fn) {
     if (!ctx || !buf || !write_fn) {
         return TIPI_ENULL;
     }
 
-    if (buf_size < sizeof(tipi_record_t)) {
+    if (buf_size < 16 || buf_size > 200) {
         return TIPI_EINVALID;
     }
 
-    ctx->buffer = buf;
-    ctx->size = buf_size;
-    ctx->head = 0;
-    ctx->tail = 0;
+    memset(ctx, 0, sizeof(tipi_ctx_t));
+    ctx->tx_buffer = buf;
+    ctx->tx_cap = buf_size;
+    ctx->tx_len = 0;
     ctx->write = write_fn;
-
-    return TIPI_ENONE;
-}
-
-tipi_error_t tipi_tick(tipi_ctx_t* ctx) {
-    if (!ctx) {
-        return TIPI_ENULL;
-    }
-
-    uint16_t cap = ctx->size / sizeof(tipi_record_t);
-    tipi_record_t* array = (tipi_record_t*)ctx->buffer;
-
-    while (ctx->tail != ctx->head) {
-        tipi_record_t* rec = &array[ctx->tail];
-        uint8_t wire_type = rec->key & 0x07;
-        uint8_t scratch[5];
-
-        uint8_t k_len = stipi_encode_varint(rec->key, scratch);
-        ctx->write(scratch, k_len);
-
-        if (wire_type == TIPI_WIRE_VARINT) {
-            uint8_t v_len = stipi_encode_varint(rec->data.u32, scratch);
-            ctx->write(scratch, v_len);
-        }
-        else if (wire_type == TIPI_WIRE_FIX32) {
-            ctx->write((uint8_t*)&rec->data.u32, 4);
-        }
-        else if (wire_type == TIPI_WIRE_LEN) {
-            uint8_t l_len = stipi_encode_varint(rec->data.blob.len, scratch);
-            ctx->write(scratch, l_len);
-            ctx->write(rec->data.blob.ptr, rec->data.blob.len);
-        }
-
-        ctx->tail = (ctx->tail + 1) % cap;
-    }
-    return TIPI_ENONE;
-}
-
-tipi_error_t tipi_parse_byte(tipi_ctx_t* ctx, uint8_t byte) {
-    if (!ctx || !ctx->handler) {
-        return TIPI_ENULL;
-    }
-
-    switch (ctx->state) {
-    case STATE_IDLE:
-        ctx->current_tag = byte >> 3;
-        ctx->current_wire = byte & 0x07;
-
-        if (ctx->current_wire == TIPI_WIRE_VARINT) {
-            ctx->state = STATE_VARINT;
-            ctx->accumulator = 0;
-            ctx->shift = 0;
-        }
-        else if (ctx->current_wire == TIPI_WIRE_FIX32) {
-            ctx->state = STATE_FIX32;
-            ctx->scratch_idx = 0;
-        }
-        else if (ctx->current_wire == TIPI_WIRE_LEN) {
-            ctx->state = STATE_LEN_HEADER;
-            ctx->accumulator = 0;
-            ctx->shift = 0;
-        }
-        else {
-            return TIPI_EINVALID;
-        }
-        break;
-
-    case STATE_VARINT:
-        ctx->accumulator |= (uint32_t)(byte & 0x7F) << ctx->shift;
-        if (!(byte & 0x80)) {
-            ctx->handler(ctx->current_tag, (uint8_t*)&ctx->accumulator, 4);
-            ctx->state = STATE_IDLE;
-        }
-        else {
-            ctx->shift += 7;
-            if (ctx->shift >= 35) {
-                return TIPI_EINVALID;
-            }
-        }
-        break;
-
-    case STATE_FIX32:
-        ctx->scratch[ctx->scratch_idx++] = byte;
-        if (ctx->scratch_idx == 4) {
-            ctx->handler(ctx->current_tag, ctx->scratch, 4);
-            ctx->state = STATE_IDLE;
-        }
-        break;
-
-    case STATE_LEN_HEADER:
-        ctx->accumulator |= (uint32_t)(byte & 0x7F) << ctx->shift;
-        if (!(byte & 0x80)) {
-            if (ctx->accumulator > 256) {
-                return TIPI_EINVALID;
-            }
-            ctx->scratch_idx = 0;
-            ctx->state = (ctx->accumulator == 0) ? STATE_IDLE : STATE_BLOB_BODY;
-            if (ctx->accumulator == 0) {
-                ctx->handler(ctx->current_tag, NULL, 0);
-            }
-        }
-        else {
-            ctx->shift += 7;
-        }
-        break;
-
-    case STATE_BLOB_BODY:
-        ctx->scratch[ctx->scratch_idx++] = byte;
-        if (ctx->scratch_idx == ctx->accumulator) {
-            ctx->handler(ctx->current_tag, ctx->scratch, (uint16_t)ctx->accumulator);
-            ctx->state = STATE_IDLE;
-        }
-        break;
-    }
-
+    
     return TIPI_ENONE;
 }
 
 tipi_error_t tipi_stream_i8(tipi_ctx_t* ctx, uint8_t tag, int8_t value) {
-    return tipi_stream_u32(ctx, tag, value);
+    return tipi_stream_u32(ctx, tag, stipi_zigzag_encode((int32_t)value));
 }
 
 tipi_error_t tipi_stream_i16(tipi_ctx_t* ctx, uint8_t tag, int16_t value) {
-    return tipi_stream_u32(ctx, tag, value);
+    return tipi_stream_u32(ctx, tag, stipi_zigzag_encode((int32_t)value));
 }
 
 tipi_error_t tipi_stream_i32(tipi_ctx_t* ctx, uint8_t tag, int32_t value) {
-    return tipi_stream_u32(ctx, tag, (uint32_t)value);
+    return tipi_stream_u32(ctx, tag, stipi_zigzag_encode(value));
 }
 
 tipi_error_t tipi_stream_u8(tipi_ctx_t* ctx, uint8_t tag, uint8_t value) {
-    return tipi_stream_u32(ctx, tag, value);
+    return tipi_stream_u32(ctx, tag, (uint32_t)value);
 }
 
 tipi_error_t tipi_stream_u16(tipi_ctx_t* ctx, uint8_t tag, uint16_t value) {
-    return tipi_stream_u32(ctx, tag, value);
+    return tipi_stream_u32(ctx, tag, (uint32_t)value);
 }
 
 tipi_error_t tipi_stream_u32(tipi_ctx_t* ctx, uint8_t tag, uint32_t value) {
-    tipi_record_t rec = {.key = (tag << 3) | TIPI_WIRE_VARINT, .data.u32 = value};
-    return stipi_push_record(ctx, &rec);
+    if (!ctx) {
+        return TIPI_ENULL;
+    }
+
+    uint8_t buf[10];
+    uint8_t idx = stipi_encode_varint((tag << 3) | 0, &buf[0]);
+    idx += stipi_encode_varint(value, &buf[idx]);
+
+    stipi_write_raw(ctx, buf, idx);
+    stipi_flush_frame(ctx);
+    return TIPI_ENONE;
 }
 
 tipi_error_t tipi_stream_float(tipi_ctx_t* ctx, uint8_t tag, float value) {
-    tipi_record_t rec = {.key = (tag << 3) | TIPI_WIRE_FIX32};
-    memcpy(&rec.data.u32, &value, 4);
-    return stipi_push_record(ctx, &rec);
+    if (!ctx) {
+        return TIPI_ENULL;
+    }
+
+    uint8_t buf[10];
+    uint8_t idx = stipi_encode_varint((tag << 3) | 5, &buf[0]);
+    uint32_t raw_bits;
+    memcpy(&raw_bits, &value, 4);
+
+    buf[idx++] = (uint8_t)(raw_bits & 0xFF);
+    buf[idx++] = (uint8_t)((raw_bits >> 8) & 0xFF);
+    buf[idx++] = (uint8_t)((raw_bits >> 16) & 0xFF);
+    buf[idx++] = (uint8_t)((raw_bits >> 24) & 0xFF);
+
+    stipi_write_raw(ctx, buf, (uint16_t)idx);
+    stipi_flush_frame(ctx);
+    return TIPI_ENONE;
 }
 
-tipi_error_t tipi_stream_blob(tipi_ctx_t* ctx, uint8_t tag, const uint8_t* data, size_t len) {
-    tipi_record_t rec = {
-            .key = (tag << 3) | TIPI_WIRE_LEN,
-            .data.blob.ptr = data,
-            .data.blob.len = len
-        };
-    return stipi_push_record(ctx, &rec);
+tipi_error_t tipi_stream_blob(tipi_ctx_t* ctx, uint8_t tag, const uint8_t* data, uint16_t len) {
+    if (!ctx) {
+        return TIPI_ENULL;
+    }
+
+    uint8_t header[10];
+    uint8_t h_len = stipi_encode_varint((tag << 3) | 2, &header[0]);
+    h_len += stipi_encode_varint((uint32_t)len, &header[h_len]);
+
+    stipi_write_raw(ctx, header, h_len);
+    stipi_write_raw(ctx, data, len);
+    stipi_flush_frame(ctx);
+
+    return TIPI_ENONE;
+}
+
+void stipi_write_raw(tipi_ctx_t* ctx, const uint8_t* data, uint16_t len) {
+    uint16_t written = 0;
+    while (written < len) {
+        uint16_t safe_cap = ctx->tx_cap - 8;
+
+        if (ctx->tx_len >= safe_cap) {
+            stipi_flush_frame(ctx);
+        }
+
+        uint16_t available = safe_cap - ctx->tx_len;
+        uint16_t to_copy = (len - written) < available ? (len - written) : available;
+
+        memcpy(&ctx->tx_buffer[ctx->tx_len], &data[written], to_copy);
+        ctx->tx_len += to_copy;
+        written += to_copy;
+    }
+}
+
+void stipi_flush_frame(tipi_ctx_t* ctx) {
+    if (ctx->tx_len == 0) {
+        return;
+    }
+
+    uint16_t crc = stipi_crc16(ctx->tx_buffer, ctx->tx_len);
+    ctx->tx_buffer[ctx->tx_len++] = (uint8_t)(crc & 0xFF);
+    ctx->tx_buffer[ctx->tx_len++] = (uint8_t)(crc >> 8);
+
+    uint8_t encoded[256];
+    uint16_t enc_len = stipi_cobs_encode(ctx->tx_buffer, ctx->tx_len, encoded);
+    uint8_t zero = 0;
+
+    ctx->write(encoded, enc_len);
+    ctx->write(&zero, 1);
+    ctx->tx_len = 0;
 }
 
 uint8_t stipi_encode_varint(uint32_t value, uint8_t* out) {
@@ -187,16 +143,42 @@ uint8_t stipi_encode_varint(uint32_t value, uint8_t* out) {
     return i;
 }
 
-tipi_error_t stipi_push_record(tipi_ctx_t* ctx, tipi_record_t* rec) {
-    uint16_t cap = ctx->size / sizeof(tipi_record_t);
-    uint16_t next = (ctx->head + 1) % cap;
-
-    if (next == ctx->tail) {
-        return TIPI_EFULL;
+uint16_t stipi_crc16(const uint8_t* data, uint16_t len) {
+    uint16_t crc = 0xFFFF;
+    for (uint16_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            if (crc & 1) crc = (crc >> 1) ^ 0xA001;
+            else crc >>= 1;
+        }
     }
+    return crc;
+}
 
-    tipi_record_t* array = (tipi_record_t*)ctx->buffer;
-    array[ctx->head] = *rec;
-    ctx->head = next;
-    return TIPI_ENONE;
+uint16_t stipi_cobs_encode(const uint8_t* ptr, uint16_t length, uint8_t* dst) {
+    uint16_t write_index = 1;
+    uint16_t code_index = 0;
+    uint8_t code = 1;
+
+    for (uint16_t i = 0; i < length; i++) {
+        if (ptr[i] == 0) {
+            dst[code_index] = code;
+            code = 1;
+            code_index = write_index++;
+        } else {
+            dst[write_index++] = ptr[i];
+            code++;
+            if (code == 0xFF) {
+                dst[code_index] = code;
+                code = 1;
+                code_index = write_index++;
+            }
+        }
+    }
+    dst[code_index] = code;
+    return write_index;
+}
+
+uint32_t stipi_zigzag_encode(int32_t n) {
+    return (uint32_t)((n << 1) ^ (n >> 31));
 }
